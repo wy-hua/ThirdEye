@@ -1,21 +1,23 @@
 from openai import OpenAI
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from datetime import datetime
 import mysql.connector
 from typing import Optional, List
 import json
-
+import logging
 # Load OpenAI API key from .env file
 from dotenv import load_dotenv
 import os
 load_dotenv()
 client = OpenAI()
+logger = logging.getLogger(__name__)
 OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID")
 
 
 app = FastAPI()
+
 
 class QueryRequest(BaseModel):
     query: str
@@ -25,6 +27,17 @@ class QueryKeyword(BaseModel):
     from_date: Optional[datetime] = None
     to_date: Optional[datetime] = None
     people_names: Optional[List[str]] = []
+    def is_empty(self) -> bool:
+        """
+        Check if all fields in the QueryKeyword instance are empty.
+        Returns True if all fields are empty/None/[], False otherwise.
+        """
+        return not any([
+            self.location is not None,
+            self.from_date is not None,
+            self.to_date is not None,
+            len(self.people_names) > 0
+        ])
 
 def get_db_connection():
     return mysql.connector.connect(
@@ -33,6 +46,10 @@ def get_db_connection():
         password="mypassword",
         database="mydatabase"
     )
+
+
+
+
 
 def extract_entities(query: str) -> QueryKeyword:
     """ Use OpenAI's API to extract key entities from user input. """
@@ -75,7 +92,7 @@ def search_images(location: Optional[str], from_date: Optional[datetime], to_dat
     params = []
 
 
-    query = "SELECT id, shot_at_when, shot_at_where, people_involved, image_description FROM images WHERE 1=1"
+    query = "SELECT id, shot_at_when, shot_at_where, people_involved, image_description, image_path FROM images WHERE 1=1"
 
     if location:
         conditions.append("shot_at_where LIKE %s")
@@ -112,7 +129,8 @@ def search_images(location: Optional[str], from_date: Optional[datetime], to_dat
                 "shot_at_when": row[1].isoformat(),
                 "shot_at_where": row[2],
                 "people_involved": eval(row[3]) if row[3] else [],
-                "image_description": row[4]
+                "image_description": row[4],
+                "image_path": row[5]
             })
         return results
     finally:
@@ -120,10 +138,10 @@ def search_images(location: Optional[str], from_date: Optional[datetime], to_dat
         conn.close()
 
 
-def generate_story(images):
+def generate_story(images, people_involved:list[str]):
     """Generate a casual storytelling description like a friend sharing their day"""
 
-    image_text = "\n".join([f"- {img['image_description']} (Taken on {img['shot_at_when']})" for img in images])
+    image_text = "\n".join([f"- {img['image_description']} (Taken on {img['shot_at_when']}) at place {img['shot_at_where']}" for img in images])
 
     prompt = f"""
     Here are some images with metadata:
@@ -131,7 +149,8 @@ def generate_story(images):
     {image_text}
 
     Describe these images like you're telling a friend about your day. 
-    Keep it natural, personal, and easygoing—like a casual chat.
+    Keep it natural, personal, and easygoing—like a casual chat. There are {len(images)} images. Please make it around {len(images)*3} sentences.
+    Make the narrative from a third-person perspective. These photoes are taken by {people_involved}.
     """
 
     response = client.chat.completions.create(
@@ -151,30 +170,56 @@ async def root():
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return {"message": f"Hello World! Current time is: {current_time}"}
 
+
+
+
+
+
 @app.post("/album_query")
 async def album_query(request: QueryRequest):
     """ Handles user queries and returns structured results and storytelling descriptions. """
+    try:
+        # Step 1: Extract structured query keywords
+        extracted_keywords : QueryKeyword = extract_entities(request.query)
+        logger.info(f"Extracted keywords: {extracted_keywords}")
+        if extracted_keywords.is_empty():
+            return {
+                "query_keywords": extracted_keywords.dict(),
+                "image_metadata": [],
+                "story_description": "Please provide search criteria like dates, locations, or people's names"
+            }
 
-    # Step 1: Extract structured query keywords
-    extracted_keywords : QueryKeyword = extract_entities(request.query)
-    # If from_date and to_date are the same, adjust to_date to end of day
-    if extracted_keywords.from_date and extracted_keywords.to_date and extracted_keywords.from_date == extracted_keywords.to_date:
-        extracted_keywords.to_date = extracted_keywords.to_date.replace(hour=23, minute=59, second=59)
-    # Step 2: Query the database
-    images = search_images(
-        extracted_keywords.location,
-        extracted_keywords.from_date,
-        extracted_keywords.to_date,
-        extracted_keywords.people_names
-    )
+        # If from_date and to_date are the same, adjust to_date to end of day
+        if extracted_keywords.from_date and extracted_keywords.to_date and extracted_keywords.from_date == extracted_keywords.to_date:
+            extracted_keywords.to_date = extracted_keywords.to_date.replace(hour=23, minute=59, second=59)
 
-    # Step 3: Generate storytelling description
-    story_description = generate_story(images)
+        # Step 2: Query the database
+        images = search_images(
+            extracted_keywords.location,
+            extracted_keywords.from_date,
+            extracted_keywords.to_date,
+            extracted_keywords.people_names
+        )
+        if len(images) == 0:
+            return {
+                "query_keywords": extracted_keywords.dict(),
+                "image_metadata": [],
+                "story_description": f"extracted_keywords.people_names" 
+            }
+        # Step 3: Generate storytelling description
+        story_description = generate_story(images, extracted_keywords.people_names)
 
-    return {
-        "query_keywords": extracted_keywords.dict(),
-        "image_metadata": images,
-        "story_description": story_description
-    }
+        return {
+            "query_keywords": extracted_keywords.dict(),
+            "image_metadata": images,
+            "story_description": story_description,
+            "image_paths": [img["image_path"] for img in images]
+        }
+
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 
