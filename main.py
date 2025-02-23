@@ -1,6 +1,5 @@
 from openai import OpenAI
 
-client = OpenAI(api_key=os.getenv("VITE_OPENAI_API_KEY"))
 from fastapi import FastAPI
 from pydantic import BaseModel
 from datetime import datetime
@@ -11,8 +10,10 @@ import json
 # Load OpenAI API key from .env file
 from dotenv import load_dotenv
 import os
-
 load_dotenv()
+client = OpenAI()
+OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID")
+
 
 app = FastAPI()
 
@@ -44,20 +45,26 @@ def extract_entities(query: str) -> QueryKeyword:
     JSON Schema:
     {{
         "location": "City or place name if mentioned, otherwise null",
-        "from_date": "Start date if present, otherwise null (ISO 8601 format YYYY-MM-DD)",
-        "to_date": "End date if present, otherwise null (ISO 8601 format YYYY-MM-DD)",
+        "from_date": "Start date if present, otherwise null (ISO 8601 format YYYY-MM-DD). This year is 2025",
+        "to_date": "End date if present, otherwise null (ISO 8601 format YYYY-MM-DD). This year is 2025",
         "people_names": ["List of people's names mentioned"]
     }}
 
     JSON Output:
     """
 
-    response = client.chat.completions.create(model="gpt-4",
-    messages=[{"role": "system", "content": "You are an assistant that extracts structured information."},
-              {"role": "user", "content": prompt}],
-    temperature=0)
-
-    extracted_data = json.loads(response.choices[0].message.content)
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL_ID,
+        messages=[{"role": "system", "content": "You are an assistant that extracts structured information."},
+                 {"role": "user", "content": prompt}],
+        temperature=0)
+    # Handle case where response might be in a code block
+    content = response.choices[0].message.content.strip()
+    if content.startswith("```json"):
+        content = content[7:]  # Remove ```json
+    if content.endswith("```"):
+        content = content[:-3]  # Remove ```
+    extracted_data = json.loads(content.strip())
     return QueryKeyword(**extracted_data)
 
 
@@ -66,6 +73,7 @@ def search_images(location: Optional[str], from_date: Optional[datetime], to_dat
 
     conditions = []
     params = []
+
 
     query = "SELECT id, shot_at_when, shot_at_where, people_involved, image_description FROM images WHERE 1=1"
 
@@ -113,33 +121,45 @@ def search_images(location: Optional[str], from_date: Optional[datetime], to_dat
 
 
 def generate_story(images):
-    """ Generate a storytelling description using OpenAI's API """
+    """Generate a casual storytelling description like a friend sharing their day"""
 
     image_text = "\n".join([f"- {img['image_description']} (Taken on {img['shot_at_when']})" for img in images])
 
     prompt = f"""
     Here are some images with metadata:
-    
+
     {image_text}
-    
-    Write a storytelling description that connects these images in an engaging way.
+
+    Describe these images like you're telling a friend about your day. 
+    Keep it natural, personal, and easygoing—like a casual chat.
     """
 
-    response = client.chat.completions.create(model="gpt-4",
-    messages=[{"role": "system", "content": "You are a creative storyteller."},
-              {"role": "user", "content": prompt}],
-    temperature=0.7)
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL_ID,
+        messages=[
+            {"role": "system", "content": "You're a friendly and casual storyteller. Share the story in a way that feels like a relaxed conversation with a friend."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.5  # Adjusted to reduce overly polished storytelling
+    )
 
     return response.choices[0].message.content
 
+
+@app.get("/")
+async def root():
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return {"message": f"Hello World! Current time is: {current_time}"}
 
 @app.post("/album_query")
 async def album_query(request: QueryRequest):
     """ Handles user queries and returns structured results and storytelling descriptions. """
 
     # Step 1: Extract structured query keywords
-    extracted_keywords = extract_entities(request.query)
-
+    extracted_keywords : QueryKeyword = extract_entities(request.query)
+    # If from_date and to_date are the same, adjust to_date to end of day
+    if extracted_keywords.from_date and extracted_keywords.to_date and extracted_keywords.from_date == extracted_keywords.to_date:
+        extracted_keywords.to_date = extracted_keywords.to_date.replace(hour=23, minute=59, second=59)
     # Step 2: Query the database
     images = search_images(
         extracted_keywords.location,
